@@ -47,7 +47,7 @@ AGGREGATION_FACTORS = {
 
 # Fetch Configuration
 INITIAL_DAYS_TO_FETCH = 7
-INCREMENTAL_CANDLES = 10
+INCREMENTAL_CANDLES = 2
 MIN_CANDLES_FOR_INCREMENTAL = 100
 
 MAX_RETRIES = 5
@@ -710,17 +710,17 @@ class EnhancedCryptoDataFetcher:
                 
                 # Cycle summary
                 cycle_time = time.time() - cycle_start
-                self.logger.info(f"Cycle completed: {total_processed} candles processed in {cycle_time:.2f}s")
+                self.logger.info(f"Cycle completed: {total_processed} candles processed in {cycle_time:.2f}s (5s interval)")
                 
-                # Sleep until next 15-second cycle
+                # Sleep until next 5-second cycle (:00, :05, :10, etc.)
                 now = datetime.now(timezone.utc)
                 current_second = now.second
-                next_15_boundary = ((current_second // 15) + 1) * 15
-                if next_15_boundary >= 60:
-                    next_15_boundary = 0
+                next_5_boundary = ((current_second // 5) + 1) * 5
+                if next_5_boundary >= 60:
+                    next_5_boundary = 0
                     target_time = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
                 else:
-                    target_time = now.replace(second=next_15_boundary, microsecond=0)
+                    target_time = now.replace(second=next_5_boundary, microsecond=0)
 
                 sleep_time = max(1, (target_time - now).total_seconds())
                 time.sleep(sleep_time)

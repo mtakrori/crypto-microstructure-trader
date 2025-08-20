@@ -9,8 +9,9 @@ from pathlib import Path
 
 # === DATABASE CONFIGURATION ===
 # Using your existing database structure
-DATA_DIR = 'C:/Users/Sammour/Documents/Qpredict/crypto-futures-trader/data'
-DATABASE_FILE = f'{DATA_DIR}/crypto_candles.sqlite'
+DATA_DIR = './data'  # For JSON files only
+ORIGINAL_DATA_DIR = 'C:/Users/Sammour/Documents/Qpredict/crypto-futures-trader/data'
+DATABASE_FILE = f'{ORIGINAL_DATA_DIR}/crypto_candles.sqlite'  # Keep database in original location
 
 # === TRADING SYMBOLS ===
 # Matching your existing fetcher symbols
@@ -58,13 +59,15 @@ SCALPING_CONFIG = {
 # === VOLUME PROFILE STRATEGY CONFIGURATION ===
 VOLUME_PROFILE_CONFIG = {
     'lookback_hours': 4,                # 4 hours for volume profile calculation
-    'min_level_strength': 0.6,         # 60% of maximum volume level
-    'max_distance_to_level': 0.001,     # 0.1% maximum distance from level
+    'min_level_strength': 0.7,          # Increased from 0.6 to 0.7 (stronger levels only)
+    'max_distance_to_level': 0.0008,    # Reduced from 0.001 to 0.0008 (0.08% - tighter)
     'num_bins': 50,                     # Number of price bins
     'target_profit': 0.004,             # 0.4% profit target
     'stop_buffer': 0.002,               # 0.2% stop loss buffer
     'max_hold_time': 10,                # 10 minutes maximum hold
-    'volume_confirmation': True         # Require volume confirmation
+    'volume_confirmation': True,         # Require volume confirmation
+    'min_poc_distance': 0.008,          # Add minimum 0.8% distance from POC for signals (NEW)
+    'confidence_threshold': 0.75        # Add minimum confidence threshold (NEW)
 }
 
 # === DATA VALIDATION CONFIGURATION ===

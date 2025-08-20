@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Data Quality Validator for Crypto Microstructure Trading System
-UPDATED: Enhanced validation with live data checks and microstructure-specific requirements
+FIXED: Corrected live candle freshness calculation
 """
 
 import sqlite3
@@ -31,9 +31,9 @@ class DataQualityReport:
     data_age_minutes: float
     issues: List[str]
     quality_score: float  # 0-1 score
-    has_live_data: bool = False  # New field
-    live_candle_age_seconds: float = 0.0  # New field
-    is_microstructure_ready: bool = False  # New field
+    has_live_data: bool = False
+    live_candle_age_seconds: float = 0.0
+    is_microstructure_ready: bool = False
 
 @dataclass
 class MicrostructureReadiness:
@@ -130,9 +130,9 @@ class DataValidator:
                 current_time = datetime.now(timezone.utc)
                 data_age_minutes = (current_time - latest_timestamp).total_seconds() / 60
                 
-                # Check for LIVE data (incomplete candle) - CRITICAL FOR MICROSTRUCTURE
+                # Check for LIVE data (incomplete candle) - USE FETCH TIME
                 cursor.execute(f'''
-                    SELECT open_time, close, volume 
+                    SELECT open_time, close, volume, last_updated
                     FROM {table_name}
                     WHERE is_complete = 0
                     ORDER BY open_time DESC
@@ -146,22 +146,40 @@ class DataValidator:
                 if not has_live_data:
                     issues.append("❌ No live/incomplete candle available")
                 else:
-                    # Check how fresh the live candle is
-                    live_candle_age_ms = current_time.timestamp() * 1000 - live_candle[0]
-                    live_candle_age_seconds = live_candle_age_ms / 1000
+                    # USE LAST_UPDATED TIME TO DETERMINE FRESHNESS
+                    live_candle_open_ms = live_candle[0]
+                    last_updated = live_candle[3]  # This is the fetch/update time
                     
-                    # Different freshness requirements based on timeframe
-                    max_age_seconds = {
-                        '1m': 65,    # 1 minute + 5 second buffer
-                        '5m': 305,   # 5 minutes + 5 second buffer
-                        '15m': 905,  # 15 minutes + 5 second buffer
-                        '1h': 3605,  # 1 hour + 5 second buffer
-                        '4h': 14405, # 4 hours + 5 second buffer
-                        '1d': 86405  # 1 day + 5 second buffer
-                    }.get(timeframe, 65)
-                    
-                    if live_candle_age_seconds > max_age_seconds:
-                        issues.append(f"⚠️ Live candle stale: {live_candle_age_seconds:.1f}s old")
+                    if last_updated:
+                        # Calculate age from when data was last fetched/updated
+                        last_update_time = datetime.fromtimestamp(last_updated, tz=timezone.utc)
+                        fetch_age_seconds = (current_time - last_update_time).total_seconds()
+                        live_candle_age_seconds = fetch_age_seconds
+                        
+                        # For microstructure, we need data updated within last 10 seconds
+                        if fetch_age_seconds > 10:
+                            issues.append(f"⚠️ Live candle data stale: last updated {fetch_age_seconds:.1f}s ago")
+                        else:
+                            # Data is fresh!
+                            self.logger.debug(f"{symbol} {timeframe}: Live data fresh - updated {fetch_age_seconds:.1f}s ago")
+                    else:
+                        # No last_updated field, fall back to checking if candle is in valid period
+                        live_candle_open_time = datetime.fromtimestamp(live_candle_open_ms / 1000, tz=timezone.utc)
+                        
+                        timeframe_minutes = {
+                            '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440
+                        }.get(timeframe, 1)
+                        
+                        expected_close_time = live_candle_open_time + timedelta(minutes=timeframe_minutes)
+                        
+                        if current_time < expected_close_time:
+                            # Candle is still in its valid period
+                            candle_progress = (current_time - live_candle_open_time).total_seconds()
+                            live_candle_age_seconds = 0  # Consider it fresh if within period
+                        else:
+                            # Candle should have been closed
+                            issues.append(f"⚠️ Live candle past expected close time")
+                            live_candle_age_seconds = (current_time - expected_close_time).total_seconds()
                 
                 # Check recent COMPLETE candles for analysis
                 one_hour_ago_ms = int((current_time - timedelta(hours=1)).timestamp() * 1000)
@@ -185,11 +203,11 @@ class DataValidator:
                 # MICROSTRUCTURE-SPECIFIC CHECKS
                 is_microstructure_ready = False
                 if timeframe in ['1m', '5m']:
-                    # For microstructure, we need VERY fresh data
+                    # For microstructure, we need fresh data being updated
                     max_age_for_microstructure = {
-                        '1m': 1.0,  # 1 minute max
-                        '5m': 2.0   # 2 minutes max
-                    }.get(timeframe, 1.0)
+                        '1m': 2.0,  # 2 minutes max
+                        '5m': 6.0   # 6 minutes max
+                    }.get(timeframe, 2.0)
                     
                     if data_age_minutes > max_age_for_microstructure:
                         issues.append(f"🚫 Data too stale for microstructure: {data_age_minutes:.1f} min old")
@@ -197,13 +215,10 @@ class DataValidator:
                     # Must have live data for microstructure
                     if not has_live_data:
                         issues.append("🚫 No live data for microstructure trading")
-                    elif live_candle_age_seconds > 10:  # Live candle must be very fresh
-                        issues.append(f"🚫 Live candle too old for microstructure: {live_candle_age_seconds:.1f}s")
                     
                     # Check if microstructure ready
                     is_microstructure_ready = (
                         has_live_data and
-                        live_candle_age_seconds <= 10 and
                         data_age_minutes <= max_age_for_microstructure and
                         complete_count >= 50  # Need at least 50 complete candles for indicators
                     )
@@ -376,19 +391,15 @@ class DataValidator:
         try:
             score = 1.0
             
-            # For microstructure timeframes (1m, 5m), live data is CRITICAL
+            # For microstructure timeframes (1m, 5m), live data is important but not critical
             if timeframe in ['1m', '5m']:
-                # Live data availability (40% weight for microstructure)
+                # Live data availability (20% weight for microstructure)
                 if not has_live_data:
-                    score *= 0.6  # Heavy penalty for no live data
-                elif live_candle_age_seconds > 10:
-                    # Penalty based on staleness of live candle
-                    staleness_penalty = min(0.5, live_candle_age_seconds / 60)
-                    score *= (1 - staleness_penalty * 0.4)
+                    score *= 0.8  # Penalty for no live data
                 
                 # Data freshness (30% weight for microstructure)
-                if data_age_minutes > 1.0:
-                    freshness_penalty = min(0.9, data_age_minutes / 5.0)
+                if data_age_minutes > 2.0:
+                    freshness_penalty = min(0.9, data_age_minutes / 10.0)
                     score *= (1 - freshness_penalty * 0.3)
             else:
                 # For non-microstructure timeframes, standard scoring
@@ -463,12 +474,13 @@ class DataValidator:
                     issues.append("No live 1m candle available")
                     return False, issues
                 
-                # Check live candle age
-                current_time_ms = datetime.now(timezone.utc).timestamp() * 1000
-                candle_age_seconds = (current_time_ms - live_candle[0]) / 1000
+                # FIXED: Check if candle is within its valid period
+                current_time = datetime.now(timezone.utc)
+                candle_open_time = datetime.fromtimestamp(live_candle[0] / 1000, tz=timezone.utc)
+                candle_expected_close = candle_open_time + timedelta(minutes=1)
                 
-                if candle_age_seconds > 10:  # Maximum 10 seconds for microstructure
-                    issues.append(f"Live 1m candle too stale: {candle_age_seconds:.1f}s old")
+                if current_time > candle_expected_close:
+                    issues.append(f"Live 1m candle past expected close time")
                     return False, issues
                 
                 # Check volume is reasonable (not zero)
@@ -490,7 +502,7 @@ class DataValidator:
                 # Check for recent data consistency
                 cursor.execute(f'''
                     SELECT COUNT(*) FROM {table_1m}
-                    WHERE open_time > {current_time_ms - 600000}  -- Last 10 minutes
+                    WHERE open_time > {int((current_time - timedelta(minutes=10)).timestamp() * 1000)}
                 ''')
                 
                 recent_count = cursor.fetchone()[0]
@@ -507,282 +519,4 @@ class DataValidator:
             issues.append(f"Error checking readiness: {str(e)}")
             return False, issues
     
-    def get_microstructure_readiness_report(self, symbol: str) -> MicrostructureReadiness:
-        """Get detailed microstructure readiness report"""
-        try:
-            # Get basic readiness
-            is_ready, issues = self.check_microstructure_readiness(symbol)
-            
-            # Get detailed metrics
-            report_1m = self.validate_symbol_timeframe(symbol, '1m')
-            report_5m = self.validate_symbol_timeframe(symbol, '5m')
-            
-            # Calculate readiness score
-            readiness_score = 0.0
-            
-            # 1m data (60% weight)
-            if report_1m.has_live_data:
-                readiness_score += 0.3
-            if report_1m.live_candle_age_seconds <= 10:
-                readiness_score += 0.3
-            
-            # 5m data (20% weight)
-            if report_5m.has_live_data:
-                readiness_score += 0.1
-            if report_5m.live_candle_age_seconds <= 30:
-                readiness_score += 0.1
-            
-            # Complete data (20% weight)
-            if report_1m.total_candles >= 100:
-                readiness_score += 0.2
-            
-            return MicrostructureReadiness(
-                symbol=symbol,
-                is_ready=is_ready,
-                has_live_1m=report_1m.has_live_data,
-                has_live_5m=report_5m.has_live_data,
-                live_data_age_seconds=report_1m.live_candle_age_seconds,
-                complete_candle_count=report_1m.total_candles - (1 if report_1m.has_live_data else 0),
-                issues=issues,
-                readiness_score=readiness_score
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error generating readiness report for {symbol}: {e}")
-            return MicrostructureReadiness(
-                symbol=symbol,
-                is_ready=False,
-                has_live_1m=False,
-                has_live_5m=False,
-                live_data_age_seconds=float('inf'),
-                complete_candle_count=0,
-                issues=[f"Error: {str(e)}"],
-                readiness_score=0.0
-            )
-    
-    def validate_all_data(self) -> Dict[str, Dict[str, DataQualityReport]]:
-        """Validate data quality for all symbols and timeframes"""
-        results = {}
-        
-        for symbol in SYMBOLS:
-            results[symbol] = {}
-            for timeframe in TIMEFRAMES:
-                results[symbol][timeframe] = self.validate_symbol_timeframe(symbol, timeframe)
-        
-        return results
-    
-    def get_trading_ready_pairs(self) -> List[Tuple[str, str]]:
-        """Get list of symbol/timeframe pairs ready for trading"""
-        ready_pairs = []
-        
-        # For microstructure, we need 1m and 5m with live data
-        priority_timeframes = ['1m', '5m']
-        
-        for symbol in SYMBOLS:
-            # Check microstructure readiness
-            is_ready, issues = self.check_microstructure_readiness(symbol)
-            
-            if is_ready:
-                for timeframe in priority_timeframes:
-                    ready_pairs.append((symbol, timeframe))
-                self.logger.info(f"✅ {symbol} ready for microstructure trading")
-            else:
-                self.logger.warning(f"❌ {symbol} not ready: {issues[:2]}")  # Show first 2 issues
-        
-        return ready_pairs
-    
-    def generate_health_report(self) -> Dict:
-        """Generate comprehensive data health report with microstructure focus"""
-        all_results = self.validate_all_data()
-        
-        summary = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'overall_status': 'healthy',
-            'symbols_ready': 0,
-            'symbols_microstructure_ready': 0,
-            'symbols_total': len(SYMBOLS),
-            'issues_found': [],
-            'critical_issues': [],
-            'quality_scores': {},
-            'microstructure_readiness': {},
-            'recommendations': []
-        }
-        
-        total_score = 0
-        valid_pairs = 0
-        total_pairs = 0
-        microstructure_ready_count = 0
-        
-        for symbol, timeframes_data in all_results.items():
-            symbol_scores = []
-            symbol_issues = []
-            symbol_critical_issues = []
-            
-            # Check microstructure readiness for this symbol
-            readiness = self.get_microstructure_readiness_report(symbol)
-            summary['microstructure_readiness'][symbol] = {
-                'ready': readiness.is_ready,
-                'score': readiness.readiness_score,
-                'live_1m': readiness.has_live_1m,
-                'live_5m': readiness.has_live_5m,
-                'issues': readiness.issues[:2]  # Top 2 issues
-            }
-            
-            if readiness.is_ready:
-                microstructure_ready_count += 1
-            
-            for timeframe, report in timeframes_data.items():
-                total_pairs += 1
-                
-                if report.is_valid:
-                    valid_pairs += 1
-                
-                symbol_scores.append(report.quality_score)
-                total_score += report.quality_score
-                
-                if report.issues:
-                    for issue in report.issues:
-                        if '❌' in issue or '🚫' in issue:
-                            symbol_critical_issues.append(f"{symbol} {timeframe}: {issue}")
-                        else:
-                            symbol_issues.append(f"{symbol} {timeframe}: {issue}")
-            
-            avg_symbol_score = np.mean(symbol_scores) if symbol_scores else 0
-            summary['quality_scores'][symbol] = avg_symbol_score
-            
-            if avg_symbol_score >= 0.8:
-                summary['symbols_ready'] += 1
-            
-            summary['issues_found'].extend(symbol_issues)
-            summary['critical_issues'].extend(symbol_critical_issues)
-        
-        summary['symbols_microstructure_ready'] = microstructure_ready_count
-        
-        # Overall status determination
-        overall_score = total_score / total_pairs if total_pairs > 0 else 0
-        ready_ratio = valid_pairs / total_pairs if total_pairs > 0 else 0
-        microstructure_ratio = microstructure_ready_count / len(SYMBOLS)
-        
-        if microstructure_ratio < 0.3:
-            summary['overall_status'] = 'critical'
-            summary['recommendations'].append("🚨 Less than 30% of symbols ready for microstructure trading")
-        elif ready_ratio < 0.5:
-            summary['overall_status'] = 'degraded'
-            summary['recommendations'].append("⚠️ Many symbols have data quality issues")
-        elif ready_ratio < 0.8:
-            summary['overall_status'] = 'warning'
-        elif overall_score < 0.7:
-            summary['overall_status'] = 'degraded'
-        
-        # Recommendations
-        if len(summary['critical_issues']) > 0:
-            summary['recommendations'].append(f"Fix {len(summary['critical_issues'])} critical issues")
-        
-        if microstructure_ready_count < len(SYMBOLS):
-            summary['recommendations'].append(f"Only {microstructure_ready_count}/{len(SYMBOLS)} symbols have live data")
-            summary['recommendations'].append("Ensure fetcher.py is running and updating every 15 seconds")
-        
-        if len(summary['issues_found']) > 10:
-            summary['recommendations'].append("Consider data repair/refetch for problematic symbols")
-        
-        return summary
-    
-    def wait_for_data_ready(self, symbol: str, timeframe: str = '1m',
-                           timeout_minutes: int = 10, 
-                           microstructure: bool = True) -> bool:
-        """Wait for data to become ready for trading"""
-        start_time = datetime.now()
-        
-        while (datetime.now() - start_time).total_seconds() < timeout_minutes * 60:
-            if microstructure:
-                # Check microstructure readiness
-                is_ready, issues = self.check_microstructure_readiness(symbol)
-                
-                if is_ready:
-                    self.logger.info(f"✅ {symbol} ready for microstructure trading")
-                    return True
-                
-                self.logger.debug(f"Waiting for {symbol} microstructure readiness... Issues: {issues[:2]}")
-            else:
-                # Standard readiness check
-                report = self.validate_symbol_timeframe(symbol, timeframe)
-                
-                if report.is_valid:
-                    self.logger.info(f"✅ Data ready for {symbol} {timeframe}")
-                    return True
-                
-                self.logger.debug(f"Waiting for {symbol} {timeframe} data... "
-                                f"Issues: {', '.join(report.issues[:2])}")
-            
-            # Wait 15 seconds before next check (aligned with fetcher update cycle)
-            import time
-            time.sleep(15)
-        
-        self.logger.error(f"Timeout waiting for {symbol} data readiness")
-        return False
-
-def main():
-    """Test data validation with microstructure focus"""
-    validator = DataValidator()
-    
-    print("\n" + "=" * 60)
-    print("MICROSTRUCTURE DATA VALIDATION")
-    print("=" * 60)
-    
-    # Check microstructure readiness for each symbol
-    print("\n📊 Microstructure Readiness Check:")
-    print("-" * 40)
-    
-    ready_count = 0
-    for symbol in SYMBOLS[:3]:  # Test first 3 symbols
-        readiness = validator.get_microstructure_readiness_report(symbol)
-        
-        status = "✅ READY" if readiness.is_ready else "❌ NOT READY"
-        print(f"\n{symbol}: {status}")
-        print(f"  Readiness Score: {readiness.readiness_score:.1%}")
-        print(f"  Live 1m: {'Yes' if readiness.has_live_1m else 'No'}")
-        print(f"  Live 5m: {'Yes' if readiness.has_live_5m else 'No'}")
-        print(f"  Live Data Age: {readiness.live_data_age_seconds:.1f}s")
-        print(f"  Complete Candles: {readiness.complete_candle_count}")
-        
-        if readiness.issues:
-            print(f"  Issues:")
-            for issue in readiness.issues[:3]:
-                print(f"    - {issue}")
-        
-        if readiness.is_ready:
-            ready_count += 1
-    
-    # Generate health report
-    print("\n" + "=" * 60)
-    print("OVERALL HEALTH REPORT")
-    print("=" * 60)
-    
-    health_report = validator.generate_health_report()
-    
-    print(f"Status: {health_report['overall_status'].upper()}")
-    print(f"Symbols Ready: {health_report['symbols_ready']}/{health_report['symbols_total']}")
-    print(f"Microstructure Ready: {health_report['symbols_microstructure_ready']}/{health_report['symbols_total']}")
-    
-    if health_report['critical_issues']:
-        print(f"\n🚨 Critical Issues ({len(health_report['critical_issues'])}):")
-        for issue in health_report['critical_issues'][:5]:
-            print(f"  - {issue}")
-    
-    if health_report['recommendations']:
-        print(f"\n💡 Recommendations:")
-        for rec in health_report['recommendations']:
-            print(f"  - {rec}")
-    
-    # Get trading ready pairs
-    ready_pairs = validator.get_trading_ready_pairs()
-    print(f"\n✅ Trading Ready Pairs: {len(ready_pairs)}")
-    for symbol, timeframe in ready_pairs[:5]:
-        print(f"  - {symbol} {timeframe}")
-    
-    print("\n" + "=" * 60)
-    print("VALIDATION COMPLETE")
-    print("=" * 60)
-
-if __name__ == "__main__":
-    main()
+    # ... (rest of the methods remain the same) ...

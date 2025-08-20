@@ -476,7 +476,7 @@ class VolumeProfileStrategy:
     
     def detect_poc_reversion(self, current_price: float, volume_profile: VolumeProfileData,
                            recent_df: pd.DataFrame, symbol: str) -> Optional[VolumeProfileSignal]:
-        """Detect reversion to Point of Control (POC) with LIVE DATA"""
+        """Detect reversion to Point of Control (POC) with LIVE DATA - FIXED TO BE LESS SENSITIVE"""
         if recent_df.empty or volume_profile.poc_price == 0:
             return None
         
@@ -486,16 +486,23 @@ class VolumeProfileStrategy:
         # Calculate distance from POC
         distance_from_poc = abs(current_price - volume_profile.poc_price) / current_price
         
-        # Only consider if significantly away from POC (>0.5%)
-        if distance_from_poc < 0.005:
+        # FIX: Use configured minimum distance (default 0.8%)
+        min_distance = self.config.get('min_poc_distance', 0.008)
+        
+        # Only consider if significantly away from POC
+        if distance_from_poc < min_distance:
+            return None
+        
+        # FIX: Also add maximum distance check (don't trade if too far from POC)
+        if distance_from_poc > 0.03:  # More than 3% away is too far
             return None
         
         # Check if price is moving toward POC
         price_direction_to_poc = 1 if current_price < volume_profile.poc_price else -1
         
-        # Check recent momentum toward POC
-        recent_candles = recent_df.tail(3)
-        if len(recent_candles) < 3:
+        # Check recent momentum toward POC (need stronger momentum)
+        recent_candles = recent_df.tail(5)  # Increased from 3 to 5 for better confirmation
+        if len(recent_candles) < 5:
             return None
         
         momentum_toward_poc = 0
@@ -507,29 +514,31 @@ class VolumeProfileStrategy:
                 if candle['close'] < candle['open']:
                     momentum_toward_poc += 1
         
-        # Need at least 2 out of 3 candles moving toward POC
-        if momentum_toward_poc < 2:
+        # FIX: Need at least 3 out of 5 candles moving toward POC (increased from 2/3)
+        if momentum_toward_poc < 3:
             return None
         
-        # Volume confirmation
-        volume_confirmation = latest_candle.get('volume_ratio', 1) > 1.0
+        # Volume confirmation (require stronger volume)
+        volume_confirmation = latest_candle.get('volume_ratio', 1) > 1.2  # Increased from 1.0
         
-        # Calculate confidence based on distance and momentum (boost for live)
-        base_confidence = min(0.9, 0.3 + (distance_from_poc * 20) + (momentum_toward_poc * 0.2))
-        confidence = base_confidence * (1.1 if is_live else 1.0)
+        # Calculate confidence based on distance and momentum (more conservative)
+        base_confidence = min(0.9, 0.2 + (distance_from_poc * 15) + (momentum_toward_poc * 0.15))
+        confidence = base_confidence * (1.05 if is_live else 1.0)
         
-        if confidence < 0.6:
+        # FIX: Use configured confidence threshold
+        min_confidence = self.config.get('confidence_threshold', 0.75)
+        if confidence < min_confidence:
             return None
         
         # Calculate trade parameters
         entry_price = current_price
         
         if price_direction_to_poc > 0:  # Long toward POC
-            target_price = volume_profile.poc_price
+            target_price = volume_profile.poc_price * 0.998  # Don't aim for exact POC
             stop_loss = entry_price * (1 - self.config['target_profit'] * 1.5)
             signal_type = VolumeProfileSignalType.POC_REVERSION
         else:  # Short toward POC
-            target_price = volume_profile.poc_price
+            target_price = volume_profile.poc_price * 1.002  # Don't aim for exact POC
             stop_loss = entry_price * (1 + self.config['target_profit'] * 1.5)
             signal_type = VolumeProfileSignalType.POC_REVERSION
         

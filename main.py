@@ -185,7 +185,7 @@ class CryptoMicrostructureTrader:
                 for timeframe in microstructure_timeframes:
                     report = self.data_validator.validate_symbol_timeframe(symbol, timeframe)
                     
-                    if report.is_valid:
+                    if report.is_microstructure_ready:
                         ready_pairs.append((symbol, timeframe))
                         self.logger.info(f"✓ {symbol} {timeframe} ready (score: {report.quality_score:.2f})")
                     else:
@@ -265,7 +265,10 @@ class CryptoMicrostructureTrader:
         try:
             current_time = datetime.now(timezone.utc)
             
-            for symbol, position in self.order_manager.positions.items():
+            # FIX: Create a list of positions to check (avoid modifying dict during iteration)
+            positions_to_check = list(self.order_manager.positions.items())
+            
+            for symbol, position in positions_to_check:
                 # Check if position has been open too long for its strategy
                 time_open = (current_time - position.timestamp).total_seconds() / 60  # minutes
                 
@@ -424,8 +427,13 @@ class CryptoMicrostructureTrader:
         return priorities.get(strategy, 0.5)
     
     def _process_signal(self, signal: TradingSignal):
-        """Process a trading signal"""
+        """Process a trading signal - IMPROVED VERSION"""
         try:
+            # Skip if already have position in this symbol
+            if signal.symbol in self.order_manager.positions:
+                self.logger.debug(f"Already have position in {signal.symbol}, skipping signal")
+                return
+            
             # Calculate position size
             position_calc = self.risk_manager.calculate_position_size(
                 signal_type=f"{signal.strategy}_{signal.direction}",
@@ -435,12 +443,27 @@ class CryptoMicrostructureTrader:
                 symbol=signal.symbol
             )
             
-            if not position_calc.approved or position_calc.recommended_size <= 0:
-                self.logger.debug(f"Signal rejected: {signal.symbol} {signal.strategy} - {position_calc.reason}")
+            if not position_calc.approved:
+                self.logger.debug(f"Signal rejected for {signal.symbol}: {position_calc.reason}")
+                return
+            
+            if position_calc.recommended_size <= 0:
+                self.logger.debug(f"Position size too small for {signal.symbol}: {position_calc.recommended_size}")
+                return
+            
+            # Check minimum order value
+            order_value = position_calc.recommended_size * signal.entry_price
+            min_order_value = 10  # $10 minimum
+            
+            if order_value < min_order_value:
+                self.logger.debug(f"Order value too small for {signal.symbol}: ${order_value:.2f} < ${min_order_value}")
                 return
             
             # Execute trade
             order_side = OrderSide.BUY if signal.direction == "long" else OrderSide.SELL
+            
+            self.logger.info(f"Attempting to execute: {signal.symbol} {signal.strategy} {signal.direction} "
+                          f"size={position_calc.recommended_size:.6f} value=${order_value:.2f}")
             
             order_id = self.order_manager.submit_market_order(
                 symbol=signal.symbol,
@@ -465,7 +488,7 @@ class CryptoMicrostructureTrader:
                 )
                 
                 self.logger.info(f"TRADE EXECUTED: {signal.symbol} {signal.strategy} {signal.direction} "
-                               f"size={position_calc.recommended_size:.6f} @{signal.entry_price:.6f}")
+                              f"size={position_calc.recommended_size:.6f} @{signal.entry_price:.6f}")
             else:
                 self.logger.error(f"TRADE FAILED: {signal.symbol} {signal.strategy}")
                 

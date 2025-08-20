@@ -1,0 +1,28 @@
+{
+  "risk_manager": {
+    "current_balance": 10000,
+    "daily_trades": 1,
+    "daily_pnl": 0.0,
+    "max_drawdown": 0.0,
+    "open_positions": {
+      "ETHUSDT_1755669225": {
+        "symbol": "ETHUSDT",
+        "signal_type": "volume_profile_short",
+        "size": 7.191037091369318,
+        "entry_price": 4171.86,
+        "stop_loss": 4196.89116,
+        "target_price": 4138.79606999997,
+        "exposure": 30000.0,
+        "timestamp": "2025-08-20T05:53:45.561408+00:00",
+        "unrealized_pnl": 0.0
+      }
+    },
+    "last_reset_date": "2025-08-20"
+  },
+  "order_manager": {
+    "total_trades": 2,
+    "successful_executions": 2,
+    "failed_executions": 0,
+    "positions": {}
+  }
+}
